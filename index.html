@@ -1,0 +1,259 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<title>-Indexing Z-sort Button</title>
+<meta name="viewport" content="width=device-width,initial-scale=1.0,maximum-scale=1.0,user-scalable=no">
+<style>
+  body { margin:0; background:#000; overflow:hidden; touch-action:none; }
+  canvas { display:block; width:100vw; height:100vh; }
+
+  #toggleZ {
+    position:absolute;
+    top:10px; left:10px;
+    z-index:10;
+    background:#0ff;
+    color:#000;
+    font-weight:bold;
+    border:none;
+    padding:6px 12px;
+    border-radius:4px;
+    box-shadow:0 0 8px #0ff;
+    cursor:pointer;
+    font-family:monospace;
+  }
+</style>
+</head>
+<body>
+
+<button id="toggleZ">Z-SORT: ON</button>
+<canvas id="c"></canvas>
+
+<script>
+// ================= 基本設定 =================
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d');
+let w, h;
+
+const COUNT = 10000;
+const FL = 250;
+
+const CELL_SIZE = 40;
+const RANGE = 800;
+
+let gridCols, gridRows, gridDepths, gridCount;
+let gridHead, nextPoint;
+
+const px  = new Float32Array(COUNT);
+const py  = new Float32Array(COUNT);
+const pz  = new Float32Array(COUNT);
+const pvx = new Float32Array(COUNT);
+const pvy = new Float32Array(COUNT);
+const pvz = new Float32Array(COUNT);
+const pIdx = new Int32Array(COUNT);
+
+const RADIUS = 18;
+const R2 = RADIUS * RADIUS;
+const K = 0.015;
+const MAX_SPEED = 6.0;
+
+let tick = 0;
+let Z_SORT = true;
+
+let mouse = {x:0,y:0,active:false};
+
+// ================= grid keying =================
+function resize() {
+  w = canvas.width = window.innerWidth;
+  h = canvas.height = window.innerHeight;
+
+  gridCols   = Math.ceil(RANGE / CELL_SIZE);
+  gridRows   = gridCols;
+  gridDepths = gridCols;
+  gridCount  = gridCols * gridRows * gridDepths;
+
+  gridHead   = new Int32Array(gridCount);
+  nextPoint  = new Int32Array(COUNT);
+}
+
+function gridKey(x, y, z) {
+  const gx = ((x + RANGE/2) / CELL_SIZE) | 0;
+  const gy = ((y + RANGE/2) / CELL_SIZE) | 0;
+  const gz = ((z + RANGE/2) / CELL_SIZE) | 0;
+  if (gx < 0 || gx >= gridCols ||
+      gy < 0 || gy >= gridRows ||
+      gz < 0 || gz >= gridDepths) return -1;
+  return gz * (gridRows * gridCols) + gy * gridCols + gx;
+}
+
+// ================= linked-index =================
+function buildIndex() {
+  gridHead.fill(-1);
+  for (let i = 0; i < COUNT; i++) {
+    const k = gridKey(px[i], py[i], pz[i]);
+    if (k < 0) continue;
+    nextPoint[i] = gridHead[k];
+    gridHead[k]  = i;
+  }
+}
+
+// ================= 27セル近傍 =================
+function forNeighbors(i, callback) {
+  const x = px[i], y = py[i], z = pz[i];
+  const gx = ((x + RANGE/2) / CELL_SIZE) | 0;
+  const gy = ((y + RANGE/2) / CELL_SIZE) | 0;
+  const gz = ((z + RANGE/2) / CELL_SIZE) | 0;
+
+  for (let dz = -1; dz <= 1; dz++) {
+    for (let dy = -1; dy <= 1; dy++) {
+      for (let dx = -1; dx <= 1; dx++) {
+        const nx = gx + dx;
+        const ny = gy + dy;
+        const nz = gz + dz;
+        if (nx < 0 || nx >= gridCols ||
+            ny < 0 || ny >= gridRows ||
+            nz < 0 || nz >= gridDepths) continue;
+
+        const cell = nz * (gridRows * gridCols) + ny * gridCols + nx;
+        let j = gridHead[cell];
+        while (j !== -1) {
+          if (j !== i) callback(j);
+          j = nextPoint[j];
+        }
+      }
+    }
+  }
+}
+
+// ================= DIR6 =================
+function applyDIR6(i, vx, vy, vz) {
+  const xi = px[i], yi = py[i], zi = pz[i];
+
+  forNeighbors(i, (j) => {
+    const dx = xi - px[j];
+    const dy = yi - py[j];
+    const dz = zi - pz[j];
+    const d2 = dx*dx + dy*dy + dz*dz;
+    if (d2 === 0 || d2 > R2) return;
+    const d = Math.sqrt(d2);
+    const w = K * (RADIUS - d) * (RADIUS - d);
+    vx += (dx / d) * w;
+    vy += (dy / d) * w;
+    vz += (dz / d) * w;
+  });
+
+  return {vx, vy, vz};
+}
+
+// ================= clamp =================
+function clampVelocity(vx, vy, vz) {
+  const s2 = vx*vx + vy*vy + vz*vz;
+  if (s2 > MAX_SPEED * MAX_SPEED) {
+    const s = Math.sqrt(s2);
+    const sc = MAX_SPEED / s;
+    vx *= sc; vy *= sc; vz *= sc;
+  }
+  return {vx, vy, vz};
+}
+
+// ================= init =================
+function init() {
+  resize();
+  for (let i = 0; i < COUNT; i++) {
+    pIdx[i] = i;
+    px[i] = (Math.random()-0.5) * RANGE;
+    py[i] = (Math.random()-0.5) * RANGE;
+    pz[i] = (Math.random()-0.5) * RANGE;
+  }
+}
+
+// ================= input =================
+function handleInput(e) {
+  e.preventDefault();
+  const t = e.touches ? e.touches[0] : e;
+  mouse.x = t.clientX;
+  mouse.y = t.clientY;
+  mouse.active = true;
+}
+canvas.addEventListener('touchstart', handleInput, {passive:false});
+canvas.addEventListener('touchmove', handleInput, {passive:false});
+canvas.addEventListener('touchend', () => mouse.active = false);
+
+// ================= Z-sort ボタン =================
+document.getElementById("toggleZ").onclick = () => {
+  Z_SORT = !Z_SORT;
+  document.getElementById("toggleZ").innerText =
+    "Z-SORT: " + (Z_SORT ? "ON" : "OFF");
+};
+
+// ================= main loop =================
+function loop() {
+  ctx.globalCompositeOperation = 'source-over';
+  ctx.fillStyle = 'rgba(0,5,10,0.15)';
+  ctx.fillRect(0, 0, w, h);
+
+  buildIndex();
+
+  const tx = mouse.active ? (mouse.x - w/2) : 0;
+  const ty = mouse.active ? (mouse.y - h/2) : 0;
+  const tz = mouse.active ? -150 : 0;
+
+  const phase = tick & 1;
+
+  // physics
+  for (let i = phase; i < COUNT; i += 2) {
+    let x = px[i], y = py[i], z = pz[i];
+    let vx = pvx[i], vy = pvy[i], vz = pvz[i];
+
+    let dx = tx - x, dy = ty - y, dz = tz - z;
+    let d = Math.sqrt(dx*dx + dy*dy + dz*dz) || 1;
+    vx += (dx/d) * 0.1;
+    vy += (dy/d) * 0.1;
+    vz += (dz/d) * 0.1;
+
+    ({vx, vy, vz} = applyDIR6(i, vx, vy, vz));
+    ({vx, vy, vz} = clampVelocity(vx, vy, vz));
+
+    vx *= 0.96; vy *= 0.96; vz *= 0.96;
+
+    x += vx; y += vy; z += vz;
+    px[i] = x; py[i] = y; pz[i] = z;
+    pvx[i] = vx; pvy[i] = vy; pvz[i] = vz;
+  }
+
+  // Z sort ON/OFF
+  if (Z_SORT) {
+    for (let i = 0; i < COUNT; i++) pIdx[i] = i;
+    pIdx.sort((a,b) => pz[b] - pz[a]);
+  }
+
+  // draw
+  ctx.globalCompositeOperation = 'lighter';
+  ctx.lineWidth = 1.4;
+  ctx.beginPath();
+
+  for (let k = 0; k < COUNT; k++) {
+    const i = Z_SORT ? pIdx[k] : k;
+    const scale = FL / (FL + pz[i] + 300);
+    if (scale <= 0) continue;
+
+    const sx = w/2 + px[i]*scale;
+    const sy = h/2 + py[i]*scale;
+
+    ctx.moveTo(sx, sy);
+    ctx.lineTo(sx - pvx[i]*scale*2, sy - pvy[i]*scale*2);
+  }
+
+  ctx.strokeStyle = 'hsla(180,80%,60%,0.9)';
+  ctx.stroke();
+
+  tick++;
+  requestAnimationFrame(loop);
+}
+
+window.addEventListener('resize', resize);
+init();
+loop();
+</script>
+</body>
+</html>
