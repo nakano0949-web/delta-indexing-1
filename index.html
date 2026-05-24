@@ -2,38 +2,589 @@
 <html lang="ja">
 <head>
 <meta charset="UTF-8">
-<title>-Indexing Z-sort Button</title>
+<title>-Indexing Benchmark</title>
 <meta name="viewport" content="width=device-width,initial-scale=1.0,maximum-scale=1.0,user-scalable=no">
 <style>
-  body { margin:0; background:#000; overflow:hidden; touch-action:none; }
+  body { margin:0; background:#000; overflow:hidden; touch-action:none; font-family:monospace; color:#0f0; }
   canvas { display:block; width:100vw; height:100vh; }
-
-  #toggleZ {
+  #ui {
     position:absolute;
     top:10px; left:10px;
     z-index:10;
-    background:#0ff;
-    color:#000;
-    font-weight:bold;
-    border:none;
-    padding:6px 12px;
-    border-radius:4px;
-    box-shadow:0 0 8px #0ff;
-    cursor:pointer;
-    font-family:monospace;
+    background:rgba(0,0,0,0.6);
+    padding:8px 10px;
+    border-radius:6px;
+    border:1px solid #0f0;
+    font-size:11px;
   }
+  #ui button, #ui select {
+    margin:2px 0;
+    font-family:monospace;
+    font-size:11px;
+  }
+  #ui .label { display:inline-block; width:70px; color:#0ff; }
 </style>
 </head>
 <body>
-
-<button id="toggleZ">Z-SORT: ON</button>
 <canvas id="c"></canvas>
+
+<div id="ui">
+  <div><span class="label">Method:</span>
+    <select id="methodSelect">
+      <option value="INDEXING">-Indexing</option>
+      <option value="GRID">Standard Grid</option>
+      <option value="OCTREE">Octree</option>
+      <option value="ON2">O(N^2)</option>
+    </select>
+  </div>
+  <div><span class="label">Agents:</span>
+    <select id="countSelect">
+      <option value="2000">2,000</option>
+      <option value="5000">5,000</option>
+      <option value="10000" selected>10,000</option>
+      <option value="20000">20,000</option>
+    </select>
+  </div>
+  <div>
+    <button id="toggleZ">Z-SORT: ON</button>
+    <button id="resetBtn">Reset</button>
+  </div>
+  <div style="margin-top:4px;">
+    <div><span class="label">FPS:</span> <span id="fps">0</span> (avg), <span id="fpsMin">0</span> (min)</div>
+    <div><span class="label">Frame ms:</span> <span id="ms">0</span> (avg), <span id="msMax">0</span> (max)</div>
+    <div><span class="label">App Heap:</span> <span id="heap">-</span></div>
+    <div><span class="label">Struct Size:</span> <span id="structMemory" style="color:#0ff;">-</span></div>
+    <div><span class="label">Ticks:</span> <span id="ticks">0</span></div>
+  </div>
+</div>
 
 <script>
 // ================= 基本設定 =================
 const canvas = document.getElementById('c');
 const ctx = canvas.getContext('2d');
 let w, h;
+
+let COUNT = 10000;
+const FL = 250;
+
+const CELL_SIZE = 40;
+const RANGE = 800;
+
+let gridCols, gridRows, gridDepths, gridCount;
+let gridHead, nextPoint;
+
+let px, py, pz, pvx, pvy, pvz, pIdx;
+
+const RADIUS = 18;
+const R2 = RADIUS * RADIUS;
+const K = 0.015;
+const MAX_SPEED = 6.0;
+
+let tick = 0;
+let Z_SORT = true;
+
+let mouse = {x:0,y:0,active:false};
+
+let METHOD = "INDEXING";
+
+// 計測用
+let lastTime = performance.now();
+let frameCount = 0;
+let accTime = 0;
+let accMs = 0;
+let minFps = Infinity;
+let maxMs = 0;
+
+// ================= UI =================
+const methodSelect = document.getElementById('methodSelect');
+const countSelect  = document.getElementById('countSelect');
+const toggleZBtn   = document.getElementById('toggleZ');
+const resetBtn     = document.getElementById('resetBtn');
+
+const fpsSpan         = document.getElementById('fps');
+const fpsMinSpan      = document.getElementById('fpsMin');
+const msSpan          = document.getElementById('ms');
+const msMaxSpan       = document.getElementById('msMax');
+const heapSpan        = document.getElementById('heap');
+const structMemorySpan= document.getElementById('structMemory');
+const ticksSpan       = document.getElementById('ticks');
+
+methodSelect.onchange = () => {
+  METHOD = methodSelect.value;
+  console.log("Method:", METHOD);
+  updateStructMemory(METHOD);
+};
+
+countSelect.onchange = () => {
+  COUNT = parseInt(countSelect.value, 10);
+  initArrays();
+  randomizeAgents();
+};
+
+toggleZBtn.onclick = () => {
+  Z_SORT = !Z_SORT;
+  toggleZBtn.innerText = "Z-SORT: " + (Z_SORT ? "ON" : "OFF");
+};
+
+resetBtn.onclick = () => {
+  randomizeAgents();
+  resetStats();
+};
+
+// ================= 画面・グリッド =================
+function resize() {
+  w = canvas.width = window.innerWidth;
+  h = canvas.height = window.innerHeight;
+
+  gridCols   = Math.ceil(RANGE / CELL_SIZE);
+  gridRows   = gridCols;
+  gridDepths = gridCols;
+  gridCount  = gridCols * gridRows * gridDepths;
+
+  gridHead   = new Int32Array(gridCount);
+  nextPoint  = new Int32Array(COUNT);
+}
+
+function gridKey(x, y, z) {
+  const gx = ((x + RANGE/2) / CELL_SIZE) | 0;
+  const gy = ((y + RANGE/2) / CELL_SIZE) | 0;
+  const gz = ((z + RANGE/2) / CELL_SIZE) | 0;
+  if (gx < 0 || gx >= gridCols ||
+      gy < 0 || gy >= gridRows ||
+      gz < 0 || gz >= gridDepths) return -1;
+  return gz * (gridRows * gridCols) + gy * gridCols + gx;
+}
+
+// ================= 配列初期化 =================
+function initArrays() {
+  px  = new Float32Array(COUNT);
+  py  = new Float32Array(COUNT);
+  pz  = new Float32Array(COUNT);
+  pvx = new Float32Array(COUNT);
+  pvy = new Float32Array(COUNT);
+  pvz = new Float32Array(COUNT);
+  pIdx= new Int32Array(COUNT);
+  nextPoint = new Int32Array(COUNT);
+}
+
+function randomizeAgents() {
+  for (let i = 0; i < COUNT; i++) {
+    pIdx[i] = i;
+    px[i] = (Math.random()-0.5) * RANGE;
+    py[i] = (Math.random()-0.5) * RANGE;
+    pz[i] = (Math.random()-0.5) * RANGE;
+    pvx[i] = pvy[i] = pvz[i] = 0;
+  }
+}
+
+// ================= 入力 =================
+function handleInput(e) {
+  e.preventDefault();
+  const t = e.touches ? e.touches[0] : e;
+  mouse.x = t.clientX;
+  mouse.y = t.clientY;
+  mouse.active = true;
+}
+canvas.addEventListener('touchstart', handleInput, {passive:false});
+canvas.addEventListener('touchmove', handleInput, {passive:false});
+canvas.addEventListener('touchend', () => mouse.active = false);
+canvas.addEventListener('mousedown', handleInput);
+canvas.addEventListener('mousemove', (e)=>{ if(e.buttons) handleInput(e); });
+canvas.addEventListener('mouseup', ()=> mouse.active=false);
+
+// ================= -Indexing 用 index 構築 =================
+function buildIndex_Indexing() {
+  gridHead.fill(-1);
+  for (let i = 0; i < COUNT; i++) {
+    const k = gridKey(px[i], py[i], pz[i]);
+    if (k < 0) continue;
+    nextPoint[i] = gridHead[k];
+    gridHead[k]  = i;
+  }
+}
+
+function forNeighbors_Indexing(i, callback) {
+  const x = px[i], y = py[i], z = pz[i];
+  const gx = ((x + RANGE/2) / CELL_SIZE) | 0;
+  const gy = ((y + RANGE/2) / CELL_SIZE) | 0;
+  const gz = ((z + RANGE/2) / CELL_SIZE) | 0;
+
+  for (let dz = -1; dz <= 1; dz++) {
+    for (let dy = -1; dy <= 1; dy++) {
+      for (let dx = -1; dx <= 1; dx++) {
+        const nx = gx + dx;
+        const ny = gy + dy;
+        const nz = gz + dz;
+        if (nx < 0 || nx >= gridCols ||
+            ny < 0 || ny >= gridRows ||
+            nz < 0 || nz >= gridDepths) continue;
+
+        const cell = nz * (gridRows * gridCols) + ny * gridCols + nx;
+        let j = gridHead[cell];
+        while (j !== -1) {
+          if (j !== i) callback(j);
+          j = nextPoint[j];
+        }
+      }
+    }
+  }
+}
+
+// ================= 他方式の実装 =================
+
+// --- 1. 標準グリッド (Standard Grid) ---
+let standardGrid = [];
+
+function buildIndex_Grid() {
+  const numCells = gridCols * gridRows * gridDepths;
+  
+  if (standardGrid.length !== numCells) {
+    standardGrid = new Array(numCells);
+    for (let i = 0; i < numCells; i++) standardGrid[i] = [];
+  } else {
+    for (let i = 0; i < numCells; i++) standardGrid[i].length = 0;
+  }
+  
+  for (let i = 0; i < COUNT; i++) {
+    const k = gridKey(px[i], py[i], pz[i]);
+    if (k >= 0 && k < numCells) {
+      standardGrid[k].push(i);
+    }
+  }
+}
+
+function forNeighbors_Grid(i, callback) {
+  const x = px[i], y = py[i], z = pz[i];
+  const gx = ((x + RANGE/2) / CELL_SIZE) | 0;
+  const gy = ((y + RANGE/2) / CELL_SIZE) | 0;
+  const gz = ((z + RANGE/2) / CELL_SIZE) | 0;
+
+  for (let dz = -1; dz <= 1; dz++) {
+    for (let dy = -1; dy <= 1; dy++) {
+      for (let dx = -1; dx <= 1; dx++) {
+        const nx = gx + dx;
+        const ny = gy + dy;
+        const nz = gz + dz;
+        if (nx < 0 || nx >= gridCols ||
+            ny < 0 || ny >= gridRows ||
+            nz < 0 || nz >= gridDepths) continue;
+
+        const cell = nz * (gridRows * gridCols) + ny * gridCols + nx;
+        const agents = standardGrid[cell];
+        if (agents) {
+          for (let k = 0, len = agents.length; k < len; k++) {
+            const j = agents[k];
+            if (j !== i) callback(j);
+          }
+        }
+      }
+    }
+  }
+}
+
+// --- 2. Octree (八分木) ---
+const OCTREE_MAX_DEPTH = 5;
+const OCTREE_CAPACITY = 16;
+let octreeRoot = null;
+let nodePool = [];
+let nodeCount = 0;
+
+function getOctreeNode(x, y, z, halfSize, depth) {
+  let node;
+  if (nodeCount < nodePool.length) {
+    node = nodePool[nodeCount++];
+    node.x = x; node.y = y; node.z = z;
+    node.halfSize = halfSize;
+    node.depth = depth;
+    node.children = null;
+    node.points.length = 0;
+  } else {
+    node = {
+      x, y, z, halfSize, depth,
+      children: null,
+      points: []
+    };
+    nodePool.push(node);
+    nodeCount++;
+  }
+  return node;
+}
+
+function insertOctree(node, i) {
+  if (node.children) {
+    const octant = getOctant(node, px[i], py[i], pz[i]);
+    insertOctree(node.children[octant], i);
+    return;
+  }
+  node.points.push(i);
+  if (node.points.length > OCTREE_CAPACITY && node.depth < OCTREE_MAX_DEPTH) {
+    subdivideOctree(node);
+  }
+}
+
+function getOctant(node, x, y, z) {
+  let octant = 0;
+  if (x >= node.x) octant |= 1;
+  if (y >= node.y) octant |= 2;
+  if (z >= node.z) octant |= 4;
+  return octant;
+}
+
+function subdivideOctree(node) {
+  node.children = new Array(8);
+  const q = node.halfSize / 2;
+  for (let c = 0; c < 8; c++) {
+    const nx = node.x + (c & 1 ? q : -q);
+    const ny = node.y + (c & 2 ? q : -q);
+    const nz = node.z + (c & 4 ? q : -q);
+    node.children[c] = getOctreeNode(nx, ny, nz, q, node.depth + 1);
+  }
+  for (let k = 0; k < node.points.length; k++) {
+    const pIdx = node.points[k];
+    const octant = getOctant(node, px[pIdx], py[pIdx], pz[pIdx]);
+    insertOctree(node.children[octant], pIdx);
+  }
+  node.points.length = 0;
+}
+
+function queryOctree(node, i, r, callback) {
+  const qx = px[i], qy = py[i], qz = pz[i];
+  
+  if (qx + r < node.x - node.halfSize || qx - r > node.x + node.halfSize ||
+      qy + r < node.y - node.halfSize || qy - r > node.y + node.halfSize ||
+      qz + r < node.z - node.halfSize || qz - r > node.z + node.halfSize) {
+    return;
+  }
+  
+  if (node.children) {
+    for (let c = 0; c < 8; c++) queryOctree(node.children[c], i, r, callback);
+  } else {
+    for (let k = 0; k < node.points.length; k++) {
+      const j = node.points[k];
+      if (j !== i) callback(j);
+    }
+  }
+}
+
+function buildIndex_Octree() {
+  nodeCount = 0;
+  octreeRoot = getOctreeNode(0, 0, 0, RANGE / 2, 0);
+  for (let i = 0; i < COUNT; i++) {
+    insertOctree(octreeRoot, i);
+  }
+}
+
+function forNeighbors_Octree(i, callback) {
+  queryOctree(octreeRoot, i, RADIUS, callback);
+}
+
+// --- 3. O(N^2) ---
+function buildIndex_ON2() {
+}
+
+function forNeighbors_ON2(i, callback) {
+  for (let j = 0; j < COUNT; j++) {
+    if (j !== i) callback(j);
+  }
+}
+
+// ================= メモリ計算 (Struct Size) =================
+function updateStructMemory(method) {
+  let bytes = 0;
+
+  if (method === "INDEXING") {
+    // Int32Array (4 bytes/element) x 2
+    bytes = gridHead.byteLength + nextPoint.byteLength;
+  } 
+  else if (method === "GRID") {
+    // Array of arrays overhead + references
+    bytes = (gridCount * 8) + (COUNT * 8);
+  } 
+  else if (method === "OCTREE") {
+    // Objects in pool (approx 64 bytes/node) + point array references
+    bytes = (nodePool.length * 64) + (COUNT * 8);
+  }
+  else if (method === "ON2") {
+    // No spatial data structure
+    bytes = 0;
+  }
+
+  let displayStr = "";
+  if (bytes === 0) displayStr = "0 B";
+  else if (bytes < 1024) displayStr = bytes + " B";
+  else if (bytes < 1024 * 1024) displayStr = (bytes / 1024).toFixed(1) + " KB";
+  else displayStr = (bytes / 1024 / 1024).toFixed(2) + " MB";
+
+  structMemorySpan.textContent = displayStr;
+}
+
+// ================= DIR6 =================
+function applyDIR6_withStrategy(i, vx, vy, vz, forNeighborsFn) {
+  const xi = px[i], yi = py[i], zi = pz[i];
+
+  forNeighborsFn(i, (j) => {
+    const dx = xi - px[j];
+    const dy = yi - py[j];
+    const dz = zi - pz[j];
+    const d2 = dx*dx + dy*dy + dz*dz;
+    if (d2 === 0 || d2 > R2) return;
+    const d = Math.sqrt(d2);
+    const w = K * (RADIUS - d) * (RADIUS - d);
+    vx += (dx / d) * w;
+    vy += (dy / d) * w;
+    vz += (dz / d) * w;
+  });
+
+  return {vx, vy, vz};
+}
+
+function clampVelocity(vx, vy, vz) {
+  const s2 = vx*vx + vy*vy + vz*vz;
+  if (s2 > MAX_SPEED * MAX_SPEED) {
+    const s = Math.sqrt(s2);
+    const sc = MAX_SPEED / s;
+    vx *= sc; vy *= sc; vz *= sc;
+  }
+  return {vx, vy, vz};
+}
+
+// ================= 計測 =================
+function resetStats() {
+  lastTime = performance.now();
+  frameCount = 0;
+  accTime = 0;
+  accMs = 0;
+  minFps = Infinity;
+  maxMs = 0;
+}
+
+function updateStats(now) {
+  const dt = now - lastTime;
+  lastTime = now;
+  frameCount++;
+  accTime += dt;
+  accMs += dt;
+
+  const instFps = 1000 / dt;
+  if (instFps < minFps) minFps = instFps;
+  if (dt > maxMs) maxMs = dt;
+
+  if (accTime >= 500) { // 0.5秒ごとに更新
+    const avgMs = accMs / frameCount;
+    const avgFps = 1000 / avgMs;
+
+    fpsSpan.textContent    = avgFps.toFixed(1);
+    fpsMinSpan.textContent = isFinite(minFps) ? minFps.toFixed(1) : "-";
+    msSpan.textContent     = avgMs.toFixed(2);
+    msMaxSpan.textContent  = maxMs.toFixed(2);
+    ticksSpan.textContent  = tick.toString();
+
+    if (performance.memory) {
+      const mb = performance.memory.usedJSHeapSize / (1024*1024);
+      heapSpan.textContent = mb.toFixed(1) + " MB";
+    } else {
+      heapSpan.textContent = "N/A";
+    }
+
+    updateStructMemory(METHOD); // 構造メモリの更新
+
+    // リセット
+    frameCount = 0;
+    accTime = 0;
+    accMs = 0;
+    minFps = Infinity;
+    maxMs = 0;
+  }
+}
+
+// ================= main loop =================
+function loop() {
+  const now = performance.now();
+  updateStats(now);
+
+  ctx.globalCompositeOperation = 'source-over';
+  ctx.fillStyle = 'rgba(0,5,10,0.15)';
+  ctx.fillRect(0, 0, w, h);
+
+  // index 構築
+  if (METHOD === "INDEXING") buildIndex_Indexing();
+  else if (METHOD === "GRID") buildIndex_Grid();
+  else if (METHOD === "OCTREE") buildIndex_Octree();
+  else if (METHOD === "ON2") buildIndex_ON2();
+
+  const tx = mouse.active ? (mouse.x - w/2) : 0;
+  const ty = mouse.active ? (mouse.y - h/2) : 0;
+  const tz = mouse.active ? -150 : 0;
+
+  const phase = tick & 1;
+
+  // 物理
+  for (let i = phase; i < COUNT; i += 2) {
+    let x = px[i], y = py[i], z = pz[i];
+    let vx = pvx[i], vy = pvy[i], vz = pvz[i];
+
+    let dx = tx - x, dy = ty - y, dz = tz - z;
+    let d = Math.sqrt(dx*dx + dy*dy + dz*dz) || 1;
+    vx += (dx/d) * 0.1;
+    vy += (dy/d) * 0.1;
+    vz += (dz/d) * 0.1;
+
+    let forN;
+    if (METHOD === "INDEXING") forN = forNeighbors_Indexing;
+    else if (METHOD === "GRID") forN = forNeighbors_Grid;
+    else if (METHOD === "OCTREE") forN = forNeighbors_Octree;
+    else if (METHOD === "ON2") forN = forNeighbors_ON2;
+
+    ({vx, vy, vz} = applyDIR6_withStrategy(i, vx, vy, vz, forN));
+    ({vx, vy, vz} = clampVelocity(vx, vy, vz));
+
+    vx *= 0.96; vy *= 0.96; vz *= 0.96;
+
+    x += px[i] = x + vx; 
+    y += py[i] = y + vy; 
+    z += pz[i] = z + vz;
+    pvx[i] = vx; pvy[i] = vy; pvz[i] = vz;
+  }
+
+  // Z sort
+  if (Z_SORT) {
+    for (let i = 0; i < COUNT; i++) pIdx[i] = i;
+    pIdx.sort((a,b) => pz[b] - pz[a]);
+  }
+
+  // draw
+  ctx.globalCompositeOperation = 'lighter';
+  ctx.lineWidth = 1.4;
+  ctx.beginPath();
+
+  for (let k = 0; k < COUNT; k++) {
+    const i = Z_SORT ? pIdx[k] : k;
+    const scale = FL / (FL + pz[i] + 300);
+    if (scale <= 0) continue;
+
+    const sx = w/2 + px[i]*scale;
+    const sy = h/2 + py[i]*scale;
+
+    ctx.moveTo(sx, sy);
+    ctx.lineTo(sx - pvx[i]*scale*2, sy - pvy[i]*scale*2);
+  }
+
+  ctx.strokeStyle = 'hsla(180,80%,60%,0.9)';
+  ctx.stroke();
+
+  tick++;
+  requestAnimationFrame(loop);
+}
+
+window.addEventListener('resize', () => { resize(); });
+resize();
+initArrays();
+randomizeAgents();
+resetStats();
+loop();
+</script>
+</body>
+</html>
 
 const COUNT = 5000;
 const FL = 250;
